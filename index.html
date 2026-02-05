@@ -1,0 +1,270 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Precision Loop Chopper & Zoom</title>
+    <style>
+        :root { --accent: #00ffcc; --bg: #121212; --panel: #1e1e1e; }
+        body { font-family: sans-serif; background: var(--bg); color: #eee; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        
+        .toolbar { 
+            display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; 
+            background: var(--panel); padding: 15px; border-radius: 8px; border: 1px solid #333; 
+            align-items: center; justify-content: center; width: 95vw;
+        }
+
+        .view-container {
+            width: 95vw; max-width: 1000px; height: 300px; 
+            border: 1px solid #444; border-radius: 4px; background: #000;
+            overflow-x: auto; overflow-y: hidden; position: relative;
+        }
+
+        .canvas-wrapper { position: relative; height: 100%; width: 100%; min-width: 100%; }
+        canvas { height: 100%; display: block; cursor: crosshair; }
+        
+        #cursor { 
+            position: absolute; top: 0; left: 0; width: 2px; height: 100%; 
+            background: #ff4444; display: none; pointer-events: none; z-index: 5; 
+        }
+
+        .zoom-controls { color: var(--accent); font-size: 12px; font-weight: bold; display: flex; align-items: center; gap: 8px; }
+        button { background: #333; color: white; border: 1px solid #555; padding: 8px 12px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover:not(:disabled) { background: #444; }
+        button:disabled { opacity: 0.2; }
+        .play-btn { background: #2e7d32; }
+        .danger-btn { background: #b71c1c; }
+    </style>
+</head>
+<body>
+
+    <div class="toolbar">
+        <input type="file" id="loader" accept="audio/*">
+        <button id="playBtn" class="play-btn" disabled>PLAY</button>
+        <div style="display:flex; align-items:center; gap:5px; font-size:12px;">
+            <input type="checkbox" id="loopTgl"> <label>LOOP</label>
+        </div>
+        <div class="zoom-controls">
+            <span>ZOOM:</span>
+            <input type="range" id="zoomRange" min="1" max="50" value="1" step="0.5">
+        </div>
+        <button id="trimBtn" disabled>TRIM</button>
+        <button id="cutBtn" class="danger-btn" disabled>CUT</button>
+        <button id="undoBtn" disabled>UNDO</button>
+        <button id="exportBtn" disabled>EXPORT</button>
+    </div>
+
+    <div class="view-container" id="viewBox">
+        <div class="canvas-wrapper" id="drawArea">
+            <canvas id="wv"></canvas>
+            <div id="cursor"></div>
+        </div>
+    </div>
+
+    <script>
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        let currentBuffer = null;
+        let historyStack = [];
+        let isPlaying = false;
+        let sourceNode = null;
+        let playStartTime = 0;
+        let playStartOffset = 0;
+        let selection = { start: 0, end: 0 };
+        let isDragging = false;
+        let zoomLevel = 1;
+
+        const canvas = document.getElementById('wv');
+        const ctx = canvas.getContext('2d');
+        const viewBox = document.getElementById('viewBox');
+        const drawArea = document.getElementById('drawArea');
+        const zoomRange = document.getElementById('zoomRange');
+        const cursor = document.getElementById('cursor');
+
+        // --- Optimized Audio Search ---
+        function findZeroCrossing(samples, index) {
+            if (index < 128) return 0;
+            if (index > samples.length - 128) return samples.length;
+            const range = Math.floor(128 / zoomLevel); // Adjust search based on zoom
+            let best = index, minVal = 1.0;
+            for (let i = index - range; i < index + range; i++) {
+                if (i > 0 && i < samples.length) {
+                    const val = Math.abs(samples[i]);
+                    if (val < minVal) { minVal = val; best = i; }
+                    if ((samples[i] >= 0 && samples[i-1] < 0) || (samples[i] <= 0 && samples[i-1] > 0)) return i;
+                }
+            }
+            return best;
+        }
+
+        function getSelectionSamples() {
+            const left = Math.min(selection.start, selection.end);
+            const right = Math.max(selection.start, selection.end);
+            const data = currentBuffer.getChannelData(0);
+            let s0 = Math.floor((left / canvas.width) * currentBuffer.length);
+            let s1 = Math.floor((right / canvas.width) * currentBuffer.length);
+            s0 = (left < 5) ? 0 : findZeroCrossing(data, s0);
+            s1 = (right > canvas.width - 5) ? currentBuffer.length : findZeroCrossing(data, s1);
+            return { s0, s1 };
+        }
+
+        // --- View & Zoom Management ---
+        zoomRange.oninput = (e) => {
+            zoomLevel = parseFloat(e.target.value);
+            render();
+        };
+
+        function render() {
+            const baseWidth = viewBox.clientWidth;
+            const newWidth = baseWidth * zoomLevel;
+            canvas.width = newWidth;
+            canvas.height = viewBox.clientHeight;
+            drawArea.style.width = newWidth + "px";
+
+            if (!currentBuffer) return;
+            const data = currentBuffer.getChannelData(0);
+            const step = Math.ceil(data.length / canvas.width);
+            const mid = canvas.height / 2;
+
+            ctx.fillStyle = "#000"; ctx.fillRect(0,0,canvas.width,canvas.height);
+            ctx.strokeStyle = "#00ffcc"; ctx.lineWidth = 1;
+            ctx.beginPath();
+            for (let i = 0; i < canvas.width; i++) {
+                let min = 1.0, max = -1.0;
+                const sampleIdx = i * step;
+                for (let j = 0; j < step; j++) {
+                    const s = data[sampleIdx + j];
+                    if (s < min) min = s; if (s > max) max = s;
+                }
+                ctx.moveTo(i, mid + min * mid); ctx.lineTo(i, mid + max * mid);
+            }
+            ctx.stroke();
+
+            if (selection.start !== selection.end) {
+                ctx.fillStyle = "rgba(255, 255, 255, 0.25)";
+                ctx.fillRect(selection.start, 0, selection.end - selection.start, canvas.height);
+            }
+        }
+
+        // --- Transport & Actions ---
+        function play() {
+            if (isPlaying) stop();
+            const range = (selection.start !== selection.end) ? getSelectionSamples() : {s0: 0, s1: currentBuffer.length};
+            const sTime = range.s0 / currentBuffer.sampleRate;
+            const eTime = range.s1 / currentBuffer.sampleRate;
+
+            sourceNode = audioCtx.createBufferSource();
+            sourceNode.buffer = currentBuffer;
+            sourceNode.connect(audioCtx.destination);
+            if (document.getElementById('loopTgl').checked) {
+                sourceNode.loop = true; sourceNode.loopStart = sTime; sourceNode.loopEnd = eTime;
+            }
+            sourceNode.onended = () => { if(!sourceNode.loop) stop(); };
+            playStartTime = audioCtx.currentTime;
+            playStartOffset = sTime;
+            sourceNode.start(0, sTime, sourceNode.loop ? undefined : (eTime - sTime));
+            isPlaying = true; cursor.style.display = "block";
+            requestAnimationFrame(animateCursor);
+        }
+
+        function stop() {
+            if (sourceNode) { try { sourceNode.stop(); } catch(e) {} sourceNode.disconnect(); sourceNode = null; }
+            isPlaying = false; cursor.style.display = "none";
+        }
+
+        function animateCursor() {
+            if (!isPlaying) return;
+            const range = (selection.start !== selection.end) ? getSelectionSamples() : {s0: 0, s1: currentBuffer.length};
+            const loopLen = (range.s1 - range.s0) / currentBuffer.sampleRate;
+            let elapsed = audioCtx.currentTime - playStartTime;
+            if (document.getElementById('loopTgl').checked) elapsed %= loopLen;
+            const pct = ((playStartOffset + elapsed) / currentBuffer.duration) * 100;
+            cursor.style.left = pct + "%";
+            requestAnimationFrame(animateCursor);
+        }
+
+        // --- Interaction ---
+        canvas.onmousedown = (e) => { 
+            isDragging = true; 
+            selection.start = e.offsetX; 
+            selection.end = e.offsetX; 
+        };
+        window.onmousemove = (e) => {
+            if (!isDragging) return;
+            const rect = canvas.getBoundingClientRect();
+            selection.end = Math.max(0, Math.min(e.clientX - rect.left, canvas.width));
+            render();
+        };
+        window.onmouseup = () => isDragging = false;
+
+        document.getElementById('loader').onchange = async (e) => {
+            const ab = await e.target.files[0].arrayBuffer();
+            currentBuffer = await audioCtx.decodeAudioData(ab);
+            render(); 
+            document.querySelectorAll('button').forEach(b => b.disabled = false);
+            document.getElementById('undoBtn').disabled = true;
+        };
+
+        // ... (Undo, Trim, Cut, Export logic remains the same as previous precision version)
+        document.getElementById('playBtn').onclick = () => isPlaying ? stop() : play();
+        window.onkeydown = (e) => { if(e.code === "Space") { e.preventDefault(); isPlaying ? stop() : play(); } };
+
+        // Export Helper (Restored)
+        document.getElementById('exportBtn').onclick = () => {
+            const wav = audioBufferToWav(currentBuffer);
+            const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([wav], {type:'audio/wav'})); a.download = 'loop.wav'; a.click();
+        };
+
+        function audioBufferToWav(buffer) {
+            let n = buffer.numberOfChannels, len = buffer.length * n * 2 + 44, ab = new ArrayBuffer(len), view = new DataView(ab), pos = 0;
+            const s32 = (d) => { view.setUint32(pos, d, true); pos += 4; };
+            const s16 = (d) => { view.setUint16(pos, d, true); pos += 2; };
+            s32(0x46464952); s32(len - 8); s32(0x45564157); s32(0x20746d66); s32(16); s16(1); s16(n);
+            s32(buffer.sampleRate); s32(buffer.sampleRate * n * 2); s16(n * 2); s16(16); s32(0x61746164); s32(len - pos - 4);
+            for(let i=0; i<buffer.length; i++) {
+                for(let c=0; c<n; c++) {
+                    let s = Math.max(-1, Math.min(1, buffer.getChannelData(c)[i]));
+                    view.setInt16(pos, s < 0 ? s * 0x8000 : s * 0x7FFF, true); pos += 2;
+                }
+            }
+            return ab;
+        }
+
+        document.getElementById('undoBtn').onclick = () => {
+            if (historyStack.length > 0) { currentBuffer = historyStack.pop(); render(); }
+            document.getElementById('undoBtn').disabled = historyStack.length === 0;
+        };
+
+        function applyNewBuffer(newBuf) {
+            const copy = audioCtx.createBuffer(currentBuffer.numberOfChannels, currentBuffer.length, currentBuffer.sampleRate);
+            for(let c=0; c<currentBuffer.numberOfChannels; c++) copy.getChannelData(c).set(currentBuffer.getChannelData(c));
+            historyStack.push(copy); if (historyStack.length > 5) historyStack.shift();
+            currentBuffer = newBuf; selection = { start: 0, end: 0 }; stop(); render();
+            document.getElementById('undoBtn').disabled = false;
+        }
+
+        document.getElementById('trimBtn').onclick = () => {
+            if (selection.start === selection.end) return;
+            const { s0, s1 } = getSelectionSamples();
+            const newBuf = audioCtx.createBuffer(currentBuffer.numberOfChannels, s1 - s0, currentBuffer.sampleRate);
+            for (let c = 0; c < currentBuffer.numberOfChannels; c++) {
+                newBuf.getChannelData(c).set(currentBuffer.getChannelData(c).subarray(s0, s1));
+            }
+            applyNewBuffer(newBuf);
+        };
+
+        document.getElementById('cutBtn').onclick = () => {
+            if (selection.start === selection.end) return;
+            const { s0, s1 } = getSelectionSamples();
+            const newLen = currentBuffer.length - (s1 - s0);
+            const newBuf = audioCtx.createBuffer(currentBuffer.numberOfChannels, newLen, currentBuffer.sampleRate);
+            for (let c = 0; c < currentBuffer.numberOfChannels; c++) {
+                const old = currentBuffer.getChannelData(c);
+                const newData = newBuf.getChannelData(c);
+                newData.set(old.subarray(0, s0));
+                newData.set(old.subarray(s1), s0);
+            }
+            applyNewBuffer(newBuf);
+        };
+    </script>
+</body>
+</html>
